@@ -35,7 +35,9 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_startup(application: Application):
     # Сброс вебхука, затем установка нового
     await application.bot.delete_webhook(drop_pending_updates=True)
-    await application.bot.set_webhook(url=WEBHOOK_URL)
+    await application.bot.set_webhook(
+        url=WEBHOOK_URL,
+        secret_token=WEBHOOK_SECRET, )
 
 
 # === Flask route ===
