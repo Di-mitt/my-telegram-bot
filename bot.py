@@ -64,4 +64,3 @@ if __name__ == "__main__":
         webhook_url=WEBHOOK_URL,
         secret_token=WEBHOOK_SECRET
     )
-
