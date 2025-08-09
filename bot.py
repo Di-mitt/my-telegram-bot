@@ -27,7 +27,7 @@ log = logging.getLogger("bot")
 
 # ─────────────── ОКРУЖЕНИЕ ───────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-APP_URL = os.getenv("APP_URL")                       # напр.: https://my-telegram-bot-cr3q.onrender.com
+APP_URL = os.getenv("APP_URL")                           # напр.: https://my-telegram-bot-xxxx.onrender.com
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "mySecret_2025")
 
 if not BOT_TOKEN or not APP_URL:
@@ -42,7 +42,7 @@ app_tg: Optional[Application] = None                 # PTB-приложение 
 
 _pending_lock = threading.Lock()
 _pending_updates: Deque[dict] = deque()              # буфер апдейтов, пока бот не готов
-
+_stop_event = threading.Event()                      # на случай корректного завершения
 
 # ─────────────── HANDLERS ───────────────
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -52,12 +52,10 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message and update.message.text:
         await update.message.reply_text(f"Вы написали: {update.message.text}")
 
-
 # ─────────────── HEALTH ───────────────
 @app_flask.route("/", methods=["GET"])
 def health() -> tuple[str, int]:
     return "OK", 200
-
 
 # ─────────────── WEBHOOK (Flask) ───────────────
 @app_flask.route(WEBHOOK_PATH, methods=["POST"])
@@ -72,27 +70,28 @@ def webhook_handler():
     except Exception:
         log.exception("Cannot parse webhook JSON")
         return "ok", 200
-
     if not data:
         return "ok", 200
 
-    # 3) если PTB ещё не готов — буферизуем
-    if app_tg is None:
-        with _pending_lock:
-            _pending_updates.append(data)
-        log.warning("Buffered update while bot not ready (queue=%d)", len(_pending_updates))
-        return "ok", 200
+    # 3) если PTB уже поднят — сразу в очередь PTB (без буфера)
+    if app_tg is not None:
+        try:
+            upd = Update.de_json(data, app_tg.bot)
+            app_tg.update_queue.put_nowait(upd)
+            return "ok", 200
+        except Exception:
+            log.exception("Failed to enqueue live update")
+            return "ok", 200
 
-    # 4) PTB готов — кидаем в очередь
-    try:
-        upd = Update.de_json(data, app_tg.bot)
-        app_tg.update_queue.put_nowait(upd)
-    except Exception:
-        log.exception("Failed to enqueue live update")
+    # 4) иначе — буферизуем (и флашер сам перельёт позже)
+    with _pending_lock:
+        _pending_updates.append(data)
+        q = len(_pending_updates)
+    if q % 5 == 0:  # пореже спамить логи
+        log.warning("Buffered updates while bot not ready (queue=%d)", q)
     return "ok", 200
 
-
-# ─────────────── УСТАНОВКА ВЕБХУКА ───────────────
+# ─────────────── УСТАНОВКА ВЕБХУКА (с ретраями) ───────────────
 async def _set_webhook_with_retries() -> None:
     bot = Bot(BOT_TOKEN)
     for attempt in range(5):
@@ -110,18 +109,17 @@ async def _set_webhook_with_retries() -> None:
             await asyncio.sleep(2)
     log.error("Giving up setting webhook after 5 attempts")
 
-
 def _start_webhook_setter_thread() -> None:
     def _runner():
-        time.sleep(2)  # дать gunicorn поднять порт
+        # дадим gunicorn/Flask поднять порт
+        time.sleep(2)
         try:
             asyncio.run(_set_webhook_with_retries())
         except Exception:
             log.exception("Webhook setter crashed")
     threading.Thread(target=_runner, name="webhook-setter", daemon=True).start()
 
-
-# ─────────────── ПОДЪЁМ PTB (БЕЗ run_webhook/ run_polling) ───────────────
+# ─────────────── ПОДЪЁМ PTB (без run_webhook/polling) ───────────────
 async def _async_ptb_main() -> None:
     """Создаём Application, запускаем его и держим цикл живым."""
     global app_tg
@@ -133,23 +131,15 @@ async def _async_ptb_main() -> None:
     await application.initialize()
     await application.start()
 
-    # делимся ссылкой с Flask — теперь можно сливать буфер
-    app_tg = application
+    app_tg = application  # теперь можно сливать буфер
 
-    # слить накопленные апдейты
-    with _pending_lock:
-        while _pending_updates:
-            data = _pending_updates.popleft()
-            try:
-                upd = Update.de_json(data, app_tg.bot)
-                app_tg.update_queue.put_nowait(upd)
-            except Exception:
-                log.exception("Failed to enqueue buffered update")
-
-    # держим живым (PTB сам слушает update_queue)
-    while True:
-        await asyncio.sleep(3600)
-
+    # держим живым; PTB сам слушает update_queue
+    try:
+        while not _stop_event.is_set():
+            await asyncio.sleep(3600)
+    finally:
+        await application.stop()
+        await application.shutdown()
 
 def _start_ptb_thread() -> None:
     def _runner():
@@ -161,7 +151,32 @@ def _start_ptb_thread() -> None:
             log.exception("PTB application crashed")
     threading.Thread(target=_runner, name="ptb-runner", daemon=True).start()
 
+# ─────────────── ПОСТОЯННЫЙ ФЛАШЕР БУФЕРА ───────────────
+def _start_buffer_flusher() -> None:
+    """Фоновый поток: как только app_tg готов, перелей всё из буфера.
+       Работает постоянно: на случай кратковременных рестартов PTB.
+    """
+    def _runner():
+        while not _stop_event.is_set():
+            if app_tg is not None:
+                try:
+                    # быстро переливаем всё, что накопилось
+                    batch: list[dict] = []
+                    with _pending_lock:
+                        while _pending_updates:
+                            batch.append(_pending_updates.popleft())
+                    for data in batch:
+                        try:
+                            upd = Update.de_json(data, app_tg.bot)
+                            app_tg.update_queue.put_nowait(upd)
+                        except Exception:
+                            log.exception("Failed to enqueue buffered update")
+                except Exception:
+                    log.exception("Buffer flusher loop error")
+            time.sleep(0.2)  # 200 мс между проходами
+    threading.Thread(target=_runner, name="buffer-flusher", daemon=True).start()
 
 # ─────────────── СТАРТ ПРИ ИМПОРТЕ ───────────────
 _start_ptb_thread()
 _start_webhook_setter_thread()
+_start_buffer_flusher()
