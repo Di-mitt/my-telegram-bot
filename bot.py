@@ -62,6 +62,6 @@ if __name__ == "__main__":
         port=int(os.environ.get("PORT", 10000)),
         url_path=WEBHOOK_PATH,
         webhook_url=WEBHOOK_URL,
-        secret_token=WEBHOOK_SECRET
+        secret_token=WEBHOOK_SECRET,
         on_startup=[on_startup]
     )
