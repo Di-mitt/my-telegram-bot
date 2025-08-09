@@ -1,12 +1,12 @@
 # bot.py
 from __future__ import annotations
 
-import atexit
-import logging
 import os
+import logging
 import threading
-from queue import Queue, Empty
-from typing import Optional
+import asyncio
+import signal
+from typing import Optional, List, Dict, Any
 
 from flask import Flask, request, abort
 
@@ -15,21 +15,21 @@ from telegram.ext import (
     Application,
     ApplicationBuilder,
     CommandHandler,
-    ContextTypes,
     MessageHandler,
+    ContextTypes,
     filters,
 )
 
-# ===================== ЛОГИ =====================
+# ---------- логирование ----------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 log = logging.getLogger("bot")
 
-# ===================== ENV =====================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-APP_URL = os.getenv("APP_URL")  # напр.: https://my-telegram-bot-xxxxx.onrender.com
+# ---------- переменные окружения ----------
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # обязателен
+APP_URL = os.getenv("APP_URL")      # обязателен: https://....onrender.com
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "mySecret_2025")
 
 if not BOT_TOKEN or not APP_URL:
@@ -38,160 +38,165 @@ if not BOT_TOKEN or not APP_URL:
 WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
 WEBHOOK_URL = f"{APP_URL}{WEBHOOK_PATH}"
 
-# ===================== ГЛОБАЛЬНОЕ СОСТОЯНИЕ =====================
+# ---------- глобальные объекты ----------
 app_flask = Flask(__name__)
 
-_ptb_app: Optional[Application] = None
-_ptb_ready = threading.Event()          # ядро PTB готово принимать апдейты
-_stop_event = threading.Event()         # сигнал на мягкую остановку
-_buffer: "Queue[dict]" = Queue()        # буфер входящих апдейтов (пока PTB стартует)
+app_tg: Optional[Application] = None
+_ptb_ready: bool = False
+_buffer: List[Dict[str, Any]] = []
+_buffer_lock = threading.Lock()
 
 
-# ===================== PTB HANDLERS =====================
+# ---------- PTB handlers ----------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Привет! Я на связи 🤖")
-
+    try:
+        await update.message.reply_text("Привет! Я на связи 🤖")
+    except Exception:
+        log.exception("Error in /start")
 
 async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message and update.message.text:
-        await update.message.reply_text(update.message.text)
-
-
-# ===================== СЛУЖЕБНОЕ =====================
-def _drain_buffer() -> None:
-    """Слить буфер накопленных апдейтов в очередь PTB."""
-    global _ptb_app
-    if not _ptb_app:
-        return
-    drained = 0
-    while True:
-        try:
-            json_obj = _buffer.get_nowait()
-        except Empty:
-            break
-        try:
-            upd = Update.de_json(json_obj, _ptb_app.bot)
-            _ptb_app.update_queue.put_nowait(upd)
-            drained += 1
-        except Exception:
-            log.exception("Failed to enqueue buffered update")
-    if drained:
-        log.info("Buffered updates delivered: %s", drained)
-
-
-def _ptb_runner() -> None:
-    """
-    Фоновый поток с собственным async loop для PTB:
-    - инициализирует приложение
-    - ставит вебхук
-    - помечает готовность и сливает буфер
-    - держит процесс живым до сигнала остановки
-    """
-    import asyncio
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    async def _main():
-        global _ptb_app
-
-        # Создаём PTB Application
-        _ptb_app = (
-            ApplicationBuilder()
-            .token(BOT_TOKEN)
-            .build()
-        )
-
-        # Хендлеры
-        _ptb_app.add_handler(CommandHandler("start", start_cmd))
-        _ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
-
-        # Старт PTB (без блокировки)
-        await _ptb_app.initialize()
-        await _ptb_app.start()
-
-        # Ставим (или пере-ставляем) вебхук
-        try:
-            await _ptb_app.bot.delete_webhook(drop_pending_updates=False)
-            await _ptb_app.bot.set_webhook(url=WEBHOOK_URL, secret_token=WEBHOOK_SECRET)
-            log.info("Webhook set to %s", WEBHOOK_URL)
-        except Exception:
-            log.exception("Failed to set webhook")
-
-        # Теперь готовы принимать апдейты из Flask
-        _ptb_ready.set()
-        _drain_buffer()
-
-        # Держим цикл живым, пока не придёт сигнал остановки
-        while not _stop_event.is_set():
-            await asyncio.sleep(0.5)
-
-        # Мягкая остановка
-        try:
-            await _ptb_app.stop()
-            await _ptb_app.shutdown()
-        except Exception:
-            log.exception("Error during PTB shutdown")
-
     try:
-        loop.run_until_complete(_main())
-    finally:
+        if update.message and update.message.text:
+            await update.message.reply_text(f"Вы написали: {update.message.text}")
+    except Exception:
+        log.exception("Error in echo")
+
+
+# ---------- вспомогательные ----------
+def _push_to_buffer(data: Dict[str, Any]) -> None:
+    """Кладём апдейт в буфер, пока PTB не поднялся."""
+    with _buffer_lock:
+        _buffer.append(data)
+        if len(_buffer) > 200:
+            # защищаемся от бесконечного роста
+            _buffer.pop(0)
+        log.warning("Received update, but PTB is not ready yet (buffer=%d)", len(_buffer))
+
+async def _drain_buffer() -> None:
+    """Пересылаем накопленные апдейты в PTB, когда ядро готово."""
+    global _buffer
+    if not app_tg:
+        return
+    with _buffer_lock:
+        pending = _buffer
+        _buffer = []
+    if not pending:
+        return
+    log.info("Draining buffered updates: %d", len(pending))
+    for data in pending:
         try:
-            loop.run_until_complete(loop.shutdown_asyncgens())
+            upd = Update.de_json(data, app_tg.bot)
+            app_tg.update_queue.put_nowait(upd)
         except Exception:
-            pass
-        loop.close()
+            log.exception("Failed to forward buffered update")
 
 
-# Запускаем PTB-поток при импортe модуля (когда gunicorn поднимает воркера)
-_ptb_thread = threading.Thread(target=_ptb_runner, name="ptb-runner", daemon=True)
-_ptb_thread.start()
-
-
-@atexit.register
-def _on_exit():
-    # Сигнал на остановку PTB и ожидание потока
-    _stop_event.set()
-    if _ptb_thread.is_alive():
-        _ptb_thread.join(timeout=5)
-
-
-# ===================== FLASK ROUTES =====================
-@app_flask.route("/", methods=["GET"])
+# ---------- Flask routes ----------
+@app_flask.get("/")
 def health() -> tuple[str, int]:
     return "OK", 200
 
-
-@app_flask.route(WEBHOOK_PATH, methods=["POST"])
-def webhook() -> tuple[str, int]:
-    # Проверяем секрет (Telegram присылает его в заголовке)
+@app_flask.post(WEBHOOK_PATH)
+def webhook_receiver():
+    # проверяем секрет из заголовка
     secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
     if secret != WEBHOOK_SECRET:
-        # Не наш запрос — 403
         return abort(403)
 
     try:
         data = request.get_json(force=True, silent=False)
     except Exception:
-        log.exception("Bad JSON")
+        log.exception("Bad JSON in webhook")
         return "ok", 200
 
     if not data:
         return "ok", 200
 
-    # Если PTB ещё поднимается — кладём апдейт в буфер,
-    # чтобы не терять сообщение во время рестартов воркера.
-    if not _ptb_ready.is_set():
-        _buffer.put_nowait(data)
-        log.warning("Received update, but PTB is not ready yet (buffer=%d)", _buffer.qsize())
+    log.info("Webhook JSON: %s", data)
+
+    # если PTB ещё не готов — в буфер
+    if not _ptb_ready or not app_tg:
+        _push_to_buffer(data)
         return "ok", 200
 
-    # PTB уже готов — сразу отдаём апдейт в очередь
+    # иначе сразу в очередь PTB
     try:
-        if _ptb_app is not None:
-            upd = Update.de_json(data, _ptb_app.bot)
-            _ptb_app.update_queue.put_nowait(upd)
+        upd = Update.de_json(data, app_tg.bot)
+        app_tg.update_queue.put_nowait(upd)
     except Exception:
         log.exception("Failed to enqueue update")
 
     return "ok", 200
+
+
+# ---------- запуск PTB в фоне ----------
+async def _ptb_main() -> None:
+    global app_tg, _ptb_ready
+
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    # handlers
+    application.add_handler(CommandHandler("start", start_cmd))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+
+    # инициализация PTB без run_webhook / run_polling
+    await application.initialize()
+    await application.start()
+
+    # выставляем вебхук
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=False)
+        await application.bot.set_webhook(url=WEBHOOK_URL, secret_token=WEBHOOK_SECRET)
+        log.info("Webhook set to %s", WEBHOOK_URL)
+    except Exception:
+        log.exception("Failed to set webhook")
+
+    # ядро готово — сохраняем ссылку и сливаем буфер
+    app_tg = application
+    _ptb_ready = True
+    await _drain_buffer()
+
+    # держим задачу живой до сигнала остановки
+    stop_event = asyncio.Event()
+
+    def _on_term(*_):
+        try:
+            stop_event.set()
+        except Exception:
+            pass
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _on_term)
+        except NotImplementedError:
+            # на Windows сигналов может не быть
+            pass
+
+    await stop_event.wait()
+
+    # корректное завершение
+    try:
+        await application.stop()
+        await application.shutdown()
+    except Exception:
+        log.exception("Error during PTB shutdown")
+
+
+def _bg_runner():
+    # отдельный event loop для PTB
+    try:
+        asyncio.run(_ptb_main())
+    except Exception:
+        log.exception("PTB application crashed")
+
+
+# стартуем фон сразу при импортe модуля (gunicorn импортирует модуль для wsgi)
+_thread = threading.Thread(target=_bg_runner, name="ptb-runner", daemon=True)
+_thread.start()
+
+# ---------- конец файла ----------
