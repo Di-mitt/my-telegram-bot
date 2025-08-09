@@ -12,7 +12,7 @@ from telegram.ext import (
 # --- env ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 APP_URL = os.getenv("APP_URL")  # пример: https://my-telegram-bot-xxxxx.onrender.com
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "mySecret_2025")
 
 if not BOT_TOKEN or not APP_URL:
     raise RuntimeError("Set env vars BOT_TOKEN and APP_URL")
