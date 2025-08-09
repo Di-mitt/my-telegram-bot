@@ -37,7 +37,7 @@ async def on_startup(application: Application):
     await application.bot.delete_webhook(drop_pending_updates=True)
     await application.bot.set_webhook(
         url=WEBHOOK_URL,
-        secret_token=WEBHOOK_SECRET, )
+        secret_token=WEBHOOK_SECRET )
 
 
 # === Flask route ===
