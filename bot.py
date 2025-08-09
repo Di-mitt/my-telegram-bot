@@ -63,4 +63,5 @@ if __name__ == "__main__":
         url_path=WEBHOOK_PATH,
         webhook_url=WEBHOOK_URL,
         secret_token=WEBHOOK_SECRET
+        on_startup=[on_startup]
     )
