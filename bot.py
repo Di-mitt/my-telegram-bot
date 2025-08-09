@@ -1,62 +1,58 @@
 # bot.py
 import os
-import logging
+from flask import Flask, request, abort
 from telegram import Update
 from telegram.ext import (
-    Application, ApplicationBuilder, CommandHandler, MessageHandler,
-    ContextTypes, filters,
+    Application, ApplicationBuilder, CommandHandler,
+    MessageHandler, ContextTypes, filters,
 )
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# --- Env ---
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-APP_URL = os.getenv("APP_URL", "").rstrip("/")  # без завершающего /
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
-
-if not BOT_TOKEN or not APP_URL:
-    raise RuntimeError("Set env vars BOT_TOKEN and APP_URL")
+# ======= ENV =======
+BOT_TOKEN = os.environ["BOT_TOKEN"]                # обязателен
+APP_URL = os.environ["APP_URL"]                   # напр. https://my-telegram-bot.onrender.com
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "change-me")
 
 WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
 WEBHOOK_URL = f"{APP_URL}{WEBHOOK_PATH}"
 
+# ======= Flask app (важно: на верхнем уровне!) =======
+app_flask = Flask(__name__)
 
-# --- Handlers ---
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message:
-        await update.message.reply_text("Привет! Я проснулся и на связи 🤖")
+# ======= Telegram application =======
+app_tg: Application = ApplicationBuilder().token(BOT_TOKEN).build()
 
+# handlers
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Привет! Я проснулся и на связи 🤖")
 
-async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message and update.message.text:
         await update.message.reply_text(f"Вы написали: {update.message.text}")
 
+app_tg.add_handler(CommandHandler("start", start_cmd))
+app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
 
-# --- Webhook lifecycle ---
-async def on_startup(app: Application) -> None:
-    # всегда сбрасываем старый вебхук и ставим новый
+# startup: включаем приложение и устанавливаем вебхук
+async def _startup(app: Application):
+    # инициализация/старт PTB без собственного веб-сервера
+    await app.initialize()
+    await app.start()
+    # сбрасываем и ставим вебхук на адрес нашего Flask
     await app.bot.delete_webhook(drop_pending_updates=True)
     await app.bot.set_webhook(url=WEBHOOK_URL, secret_token=WEBHOOK_SECRET)
-    logger.info("Webhook set to %s", WEBHOOK_URL)
 
+# запускаем асинхронный старт PTB в фоне при импорте модуля
+import asyncio
+asyncio.get_event_loop().create_task(_startup(app_tg))
 
-def main() -> None:
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+# ======= Flask route, куда Telegram шлет апдейты =======
+@app_flask.route(WEBHOOK_PATH, methods=["POST"])
+def webhook_handler():
+    # проверка секретного хедера
+    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
+        abort(403)
 
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
-
-    # запускаем встроенный веб-сервер PTB (никакого Flask/gunicorn)
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=int(os.environ.get("PORT", "10000")),
-        url_path=WEBHOOK_PATH,
-        webhook_url=WEBHOOK_URL,
-        secret_token=WEBHOOK_SECRET,
-        on_startup=[on_startup],
-    )
-
-
-if __name__ == "__main__":
-    main()
+    json_update = request.get_json(force=True)
+    # прокидываем апдейт в очередь PTB
+    app_tg.update_queue.put_nowait(Update.de_json(json_update, app_tg.bot))
+    return "ok"
