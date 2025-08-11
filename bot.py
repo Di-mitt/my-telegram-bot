@@ -1,262 +1,201 @@
 # bot.py
 import os
-import sys
 import json
 import time
 import logging
 import threading
 import atexit
 import asyncio
-from typing import Optional, Deque, Tuple
 from collections import deque
+from typing import Deque, Tuple, Any
 
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify
 
 from telegram import Update
 from telegram.ext import (
     Application,
-    ContextTypes,
     CommandHandler,
     MessageHandler,
     filters,
 )
 
-# -----------------------------------------------------------------------------
-# ЛОГИ
-# -----------------------------------------------------------------------------
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+# ----------------------- ЛОГИ -----------------------
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    stream=sys.stdout,
 )
 log = logging.getLogger("bot")
 
-# -----------------------------------------------------------------------------
-# КОНФИГ
-# -----------------------------------------------------------------------------
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-APP_URL = os.environ.get("APP_URL", "").strip().rstrip("/")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "mySecret_2025").strip()
+# ----------------------- ENV ------------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+APP_URL = os.getenv("APP_URL", "").rstrip("/")
 
 if not BOT_TOKEN:
-    log.error("Environment variable BOT_TOKEN is not set")
-    raise SystemExit(1)
-
+    raise RuntimeError("BOT_TOKEN is not set")
+if not WEBHOOK_SECRET:
+    raise RuntimeError("WEBHOOK_SECRET is not set")
 if not APP_URL:
-    log.warning("APP_URL not set; fallback http://0.0.0.0:10000 (local only)")
-    APP_URL = "http://0.0.0.0:10000"
+    raise RuntimeError("APP_URL is not set")
 
 WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
 WEBHOOK_URL = f"{APP_URL}{WEBHOOK_PATH}"
 
-# -----------------------------------------------------------------------------
-# PTB: LOOP/APP/ФЛАГИ
-# -----------------------------------------------------------------------------
-_ptb_loop: Optional[asyncio.AbstractEventLoop] = None
-_ptb_app: Optional[Application] = None
-_ptb_ready = threading.Event()
-_ptb_stop_event: Optional[asyncio.Event] = None
+# ----------------------- Flask ----------------------
+app_flask = Flask(__name__)
 
-# -----------------------------------------------------------------------------
-# БУФЕР ВЕБХУКА
-# -----------------------------------------------------------------------------
-BUFFER_MAX = int(os.environ.get("WEBHOOK_BUFFER_MAX", "50"))
+# -------------------- PTB runtime -------------------
+_application: Application | None = None
+_ptb_loop: asyncio.AbstractEventLoop | None = None
+_ptb_ready: bool = False
+
+# буфер апдейтов (если пришли раньше, чем запустился PTB)
+_buffer_max = 50
+_buffer: Deque[Tuple[dict, float]] = deque(maxlen=_buffer_max)
 _buffer_lock = threading.Lock()
-_buffer: Deque[Tuple[dict, float]] = deque()  # (raw_json, monotonic_ts)
 
+# событие для аккуратной остановки PTB
+_stop_event: asyncio.Event | None = None
+
+
+# --------------- Хэндлеры бота ----------------------
+async def cmd_start(update: Update, _):
+    await update.effective_chat.send_message("Привет! Я на связи 🤖")
+
+async def any_text(update: Update, _):
+    if update.message and update.message.text:
+        await update.message.reply_text(f"Ты написал: {update.message.text}")
+
+
+# --------------- Работа с буфером -------------------
 def _buffer_push(data: dict):
     with _buffer_lock:
-        while len(_buffer) >= BUFFER_MAX:
-            _buffer.popleft()
         _buffer.append((data, time.monotonic()))
-        log.warning("Webhook buffered (total=%s)", len(_buffer))
+        log.warning("Webhook: got update while PTB not ready -> buffer (total=%d)", len(_buffer))
 
-def _buffer_drain():
-    """Слить буфер в PTB (вызывается когда PTB готов)."""
-    if not (_ptb_ready.is_set() and _ptb_app and _ptb_loop):
+async def _buffer_drain():
+    """Слить накопленные апдейты в PTB после старта."""
+    global _application
+    if not _application:
         return
     drained = 0
     while True:
         with _buffer_lock:
             if not _buffer:
                 break
-            data, ts = _buffer.popleft()
+            data, _ts = _buffer.popleft()
         try:
-            upd = Update.de_json(data, _ptb_app.bot)
-            asyncio.run_coroutine_threadsafe(_ptb_app.process_update(upd), _ptb_loop)
+            upd = Update.de_json(data, _application.bot)
+            await _application.process_update(upd)
             drained += 1
-        except Exception:
-            log.exception("buffer drain: failed to schedule update")
+        except Exception as e:
+            log.exception("Buffer drain failed: %s", e)
     if drained:
-        log.info("Webhook buffer drained: %s updates flushed", drained)
+        log.info("Buffer drained: %d updates", drained)
 
-# -----------------------------------------------------------------------------
-# ХЭНДЛЕРЫ
-# -----------------------------------------------------------------------------
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Я на связи 🤖\nНапиши что-нибудь — я повторю.")
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Команды: /start, /help")
-
-async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message and update.message.text:
-        await update.message.reply_text(f"Ты написал: {update.message.text}")
-
-# -----------------------------------------------------------------------------
-# PTB ASYNC MAIN
-# -----------------------------------------------------------------------------
-async def _ptb_async_main():
-    global _ptb_app, _ptb_stop_event
+# --------------- PTB поток / цикл -------------------
+async def _ptb_start():
+    """Инициализация и запуск PTB в отдельном event loop."""
+    global _application, _ptb_ready, _stop_event
 
     log.info("PTB: building application...")
-    app = Application.builder().token(BOT_TOKEN).build()
+    _application = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+    # Роуты/хэндлеры
+    _application.add_handler(CommandHandler("start", cmd_start))
+    _application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, any_text))
 
-    await app.initialize()
-    await app.start()
+    # Инициализация/старт без собственного веб-сервера PTB —
+    # мы сами принимаем HTTP во Flask и кидаем апдейты в process_update.
+    await _application.initialize()
+    await _application.start()
 
-    # Webhook
+    # Вебхук ставим руками (его будет дергать Telegram -> Flask)
     try:
-        await app.bot.delete_webhook()
-        await app.bot.set_webhook(url=WEBHOOK_URL, secret_token=WEBHOOK_SECRET)
+        await _application.bot.delete_webhook(drop_pending_updates=False)
+        await _application.bot.set_webhook(url=WEBHOOK_URL, secret_token=WEBHOOK_SECRET)
         log.info("PTB: webhook set -> %s", WEBHOOK_URL)
-    except Exception:
-        log.exception("PTB: failed to set webhook")
+    except Exception as e:
+        log.exception("Failed to set webhook: %s", e)
 
-    _ptb_app = app
-    _ptb_ready.set()
+    _ptb_ready = True
+    await _buffer_drain()
 
-    # Слить то, что накопилось во время старта
+    _stop_event = asyncio.Event()
+    await _stop_event.wait()
+
+    # Остановка
     try:
-        _buffer_drain()
+        await _application.stop()
+        await _application.shutdown()
     except Exception:
-        log.exception("buffer drain on ready failed")
+        log.exception("PTB stop/shutdown error")
 
-    _ptb_stop_event = asyncio.Event()
-    await _ptb_stop_event.wait()
 
-    log.info("PTB: stopping...")
-    try:
-        await app.stop()
-        await app.shutdown()
-        await app.post_stop()
-    except Exception:
-        log.exception("PTB: stop error")
-
-def _ptb_thread_runner():
+def _ptb_thread():
+    """Отдельный поток с собственным asyncio loop."""
     global _ptb_loop
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    _ptb_loop = loop
+    _ptb_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_ptb_loop)
     try:
-        loop.run_until_complete(_ptb_async_main())
+        _ptb_loop.run_until_complete(_ptb_start())
     finally:
-        try:
-            pending = asyncio.all_tasks(loop)
-            for t in pending:
-                t.cancel()
-            loop.run_until_complete(loop.shutdown_asyncgens())
-        except Exception:
-            pass
-        loop.close()
-        log.info("PTB: loop closed")
+        _ptb_loop.run_until_complete(asyncio.sleep(0))
+        _ptb_loop.close()
 
-def start_ptb_background():
-    t = threading.Thread(target=_ptb_thread_runner, name="ptb-runner", daemon=True)
-    t.start()
-    return t
 
-def stop_ptb_background():
-    if _ptb_loop and _ptb_stop_event:
+# Стартуем PTB-поток сразу при импорте модуля (когда gunicorn грузит воркер)
+_ptb_thread_handle = threading.Thread(target=_ptb_thread, name="ptb-thread", daemon=True)
+_ptb_thread_handle.start()
+
+
+def _ptb_shutdown():
+    """Вызывается при завершении процесса (gunicorn SIGTERM)."""
+    global _ptb_loop, _stop_event
+    if _ptb_loop and _stop_event:
         try:
-            _ptb_loop.call_soon_threadsafe(_ptb_stop_event.set)
+            _ptb_loop.call_soon_threadsafe(_stop_event.set)
         except Exception:
             pass
 
-# -----------------------------------------------------------------------------
-# FLASK
-# -----------------------------------------------------------------------------
-app_flask = Flask(__name__)
+atexit.register(_ptb_shutdown)
 
+# -------------------- Flask routes -------------------
 @app_flask.get("/")
-def root():
-    return Response("ok", status=200, mimetype="text/plain")
+def index():
+    return "ok"
 
 @app_flask.get("/health")
 def health():
-    with _buffer_lock:
-        buf_size = len(_buffer)
     return jsonify(
         status="ok",
-        ptb_ready=_ptb_ready.is_set(),
+        ptb_ready=_ptb_ready,
+        buffer_size=len(_buffer),
+        buffer_max=_buffer_max,
         webhook_url=WEBHOOK_URL,
-        buffer_size=buf_size,
-        buffer_max=BUFFER_MAX,
     )
 
 @app_flask.post(WEBHOOK_PATH)
 def telegram_webhook():
-    # проверка секрета
+    # Проверка секрета (Telegram присылает этот заголовок)
     secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
     if secret != WEBHOOK_SECRET:
-        log.warning("Webhook: secret mismatch")
-        return ("", 403)
+        return "forbidden", 403
 
+    # Получаем апдейт
     data = request.get_json(silent=True, force=True) or {}
 
-    # если PTB не готов — кладем в буфер и 200
-    if not _ptb_ready.is_set() or _ptb_app is None or _ptb_loop is None:
-        log.warning("Webhook: got update while PTB not ready -> buffer")
+    # Если PTB ещё не готов — кладём в буфер
+    if not _ptb_ready or not _application or not _ptb_loop:
         _buffer_push(data)
-        return ("", 200)
+        return "ok", 200
 
-    # PTB готов — сразу отдаем
+    # Пробрасываем апдейт в PTB non-blocking
     try:
-        update = Update.de_json(data, _ptb_app.bot)
-        asyncio.run_coroutine_threadsafe(_ptb_app.process_update(update), _ptb_loop)
-    except Exception:
-        log.exception("Webhook: failed to schedule update")
-    return ("", 200)
-
-# админка: ручной ресет вебхука и слив буфера
-@app_flask.post("/admin/reset_webhook")
-def reset_webhook():
-    if not (_ptb_ready.is_set() and _ptb_app and _ptb_loop):
-        return jsonify(ok=False, error="PTB not ready"), 503
-
-    async def _reset():
-        await _ptb_app.bot.delete_webhook()
-        await _ptb_app.bot.set_webhook(url=WEBHOOK_URL, secret_token=WEBHOOK_SECRET)
-
-    try:
-        fut = asyncio.run_coroutine_threadsafe(_reset(), _ptb_loop)
-        fut.result(timeout=5)
-        return jsonify(ok=True, url=WEBHOOK_URL)
+        upd = Update.de_json(data, _application.bot)
+        asyncio.run_coroutine_threadsafe(_application.process_update(upd), _ptb_loop)
     except Exception as e:
-        log.exception("reset_webhook failed")
-        return jsonify(ok=False, error=str(e)), 500
+        log.exception("Webhook update processing failed: %s", e)
 
-@app_flask.post("/admin/flush_buffer")
-def flush_buffer():
-    try:
-        _buffer_drain()
-        with _buffer_lock:
-            left = len(_buffer)
-        return jsonify(ok=True, left=left)
-    except Exception as e:
-        log.exception("manual buffer flush failed")
-        return jsonify(ok=False, error=str(e)), 500
-
-# -----------------------------------------------------------------------------
-# СТАРТ PTB В ФОНЕ
-# -----------------------------------------------------------------------------
-_ptb_thread = start_ptb_background()
-
-@atexit.register
-def _graceful_shutdown():
-    stop_ptb_background()
+    return "ok", 200
