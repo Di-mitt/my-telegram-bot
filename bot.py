@@ -2,6 +2,7 @@
 import os
 import sys
 import json
+import time
 import logging
 import threading
 import atexit
@@ -58,22 +59,21 @@ _ptb_ready = threading.Event()
 _ptb_stop_event: Optional[asyncio.Event] = None
 
 # -----------------------------------------------------------------------------
-# БУФЕР ВЕБХУКА (чтобы не терять апдейты при старте)
+# БУФЕР ВЕБХУКА
 # -----------------------------------------------------------------------------
-# ограничим буфер по кол-ву, чтобы не съесть память, если что-то пойдет не так
 BUFFER_MAX = int(os.environ.get("WEBHOOK_BUFFER_MAX", "50"))
 _buffer_lock = threading.Lock()
-_buffer: Deque[Tuple[dict, float]] = deque()  # (raw_json, timestamp)
+_buffer: Deque[Tuple[dict, float]] = deque()  # (raw_json, monotonic_ts)
 
 def _buffer_push(data: dict):
     with _buffer_lock:
         while len(_buffer) >= BUFFER_MAX:
             _buffer.popleft()
-        _buffer.append((data, asyncio.get_event_loop_policy().time()))
+        _buffer.append((data, time.monotonic()))
         log.warning("Webhook buffered (total=%s)", len(_buffer))
 
 def _buffer_drain():
-    """Вызываем уже ПОСЛЕ того, как PTB готов; переносит накопленные апдейты в PTB."""
+    """Слить буфер в PTB (вызывается когда PTB готов)."""
     if not (_ptb_ready.is_set() and _ptb_app and _ptb_loop):
         return
     drained = 0
@@ -92,7 +92,7 @@ def _buffer_drain():
         log.info("Webhook buffer drained: %s updates flushed", drained)
 
 # -----------------------------------------------------------------------------
-# ХЭНДЛЕРЫ БОТА
+# ХЭНДЛЕРЫ
 # -----------------------------------------------------------------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Привет! Я на связи 🤖\nНапиши что-нибудь — я повторю.")
@@ -105,7 +105,7 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Ты написал: {update.message.text}")
 
 # -----------------------------------------------------------------------------
-# PTB ASYNC MAIN (в отдельном event loop + поток)
+# PTB ASYNC MAIN
 # -----------------------------------------------------------------------------
 async def _ptb_async_main():
     global _ptb_app, _ptb_stop_event
@@ -120,7 +120,7 @@ async def _ptb_async_main():
     await app.initialize()
     await app.start()
 
-    # Ставим вебхук после старта
+    # Webhook
     try:
         await app.bot.delete_webhook()
         await app.bot.set_webhook(url=WEBHOOK_URL, secret_token=WEBHOOK_SECRET)
@@ -128,11 +128,10 @@ async def _ptb_async_main():
     except Exception:
         log.exception("PTB: failed to set webhook")
 
-    # Готово — разрешаем принимать апдейты
     _ptb_app = app
     _ptb_ready.set()
 
-    # Сразу пробуем слить буфер (если пришло что-то во время старта)
+    # Слить то, что накопилось во время старта
     try:
         _buffer_drain()
     except Exception:
