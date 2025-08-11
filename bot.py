@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import json
 import logging
 import asyncio
 import threading
@@ -20,16 +19,16 @@ from telegram.ext import (
     filters,
 )
 
-# ---------- logging ----------
+# -------------------- logging --------------------
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
 log = logging.getLogger("bot")
 
-# ---------- env ----------
+# -------------------- env --------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-APP_URL = os.getenv("APP_URL")                    # e.g. https://<name>.onrender.com
+APP_URL = os.getenv("APP_URL")  # e.g. https://your-bot.onrender.com
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "mySecret_2025")
 
 if not BOT_TOKEN or not APP_URL:
@@ -38,18 +37,18 @@ if not BOT_TOKEN or not APP_URL:
 WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
 WEBHOOK_URL = f"{APP_URL}{WEBHOOK_PATH}"
 
-# ---------- Flask ----------
+# -------------------- Flask --------------------
 app_flask = Flask(__name__)
 
-# ---------- PTB globals ----------
+# -------------------- PTB globals --------------------
 _app: Optional[Application] = None
 _loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
 
-_ready = threading.Event()      # ставим True после старта PTB и set_webhook
+_ready = threading.Event()           # ставим True сразу после старта PTB
 _buf_lock = threading.Lock()
-_buf: deque[dict] = deque(maxlen=500)  # буфер «сырых» апдейтов
+_buf: deque[dict] = deque(maxlen=500)  # временный буфер апдейтов (сырые dict'ы)
 
-# ---------- handlers ----------
+# -------------------- handlers --------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Привет! Я на связи 🤖")
 
@@ -57,9 +56,9 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message and update.message.text:
         await update.message.reply_text(f"Вы написали: {update.message.text}")
 
-# ---------- helpers ----------
+# -------------------- helpers --------------------
 def _enqueue_update_dict(data: dict) -> None:
-    """Кладём Update в очередь PTB из чужого потока."""
+    """Помещает Update в очередь PTB из чужого потока."""
     upd = Update.de_json(data, _app.bot)  # type: ignore[arg-type]
     fut = asyncio.run_coroutine_threadsafe(_app.update_queue.put(upd), _loop)  # type: ignore[union-attr]
     try:
@@ -68,7 +67,7 @@ def _enqueue_update_dict(data: dict) -> None:
         log.exception("Failed to enqueue update")
 
 async def _drain_buffer() -> None:
-    """Сливаем накопленные апдейты в PTB (в его event loop)."""
+    """Сливает накопленные апдейты в очередь PTB (внутри PTB event loop)."""
     drained = 0
     while True:
         with _buf_lock:
@@ -83,9 +82,9 @@ async def _drain_buffer() -> None:
     if drained:
         log.info("Drained %d buffered update(s) into PTB", drained)
 
-# ---------- PTB startup (background thread + its own loop) ----------
+# -------------------- PTB startup (background thread) --------------------
 async def _ptb_init_and_run() -> None:
-    """Создаём Application, запускаем, ставим вебхук, отмечаем готовность и ждём вечно."""
+    """Создаём и запускаем PTB, отмечаем готовность, делаем первый drain, потом ставим вебхук и ждём вечно."""
     global _app
 
     log.info("PTB: building application...")
@@ -94,21 +93,24 @@ async def _ptb_init_and_run() -> None:
         .token(BOT_TOKEN)
         .build()
     )
+
     _app.add_handler(CommandHandler("start", cmd_start))
     _app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
 
     await _app.initialize()
     await _app.start()
 
+    # Сразу считаем PTB готовым и сливаем буфер (если был)
+    _ready.set()
+    await _drain_buffer()
+
+    # Теперь ставим/обновляем вебхук
     log.info("PTB: setting webhook to %s", WEBHOOK_URL)
     await _app.bot.delete_webhook(drop_pending_updates=True)
     await _app.bot.set_webhook(url=WEBHOOK_URL, secret_token=WEBHOOK_SECRET)
     log.info("PTB: webhook is set")
 
-    _ready.set()
-    await _drain_buffer()
-
-    # держим луп живым
+    # держим цикл живым
     await asyncio.Event().wait()
 
 def _ptb_thread_worker() -> None:
@@ -128,17 +130,17 @@ def _ptb_thread_worker() -> None:
         except Exception:
             pass
 
-# стартуем PTB при импорте модуля (когда gunicorn поднимает воркер)
+# стартуем PTB при импортe модуля (gunicorn worker загружает модуль)
 threading.Thread(target=_ptb_thread_worker, name="ptb-loop", daemon=True).start()
 
-# ---------- Flask routes ----------
+# -------------------- Flask routes --------------------
 @app_flask.get("/")
 def health() -> tuple[str, int]:
     return "OK", 200
 
 @app_flask.post(WEBHOOK_PATH)
 def webhook_receiver():
-    # проверка секрета
+    # Проверяем секретный заголовок Telegram
     if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
         return abort(403)
 
@@ -150,38 +152,38 @@ def webhook_receiver():
     if not data:
         return "ok", 200
 
-    # если PTB ещё стартует — ждём до 5с; если не успел — буферим
-    if not _ready.is_set():
-        if _ready.wait(timeout=5.0):
-            # только что стал готов — сперва промоем буфер, затем положим текущий апдейт
-            try:
-                asyncio.run_coroutine_threadsafe(_drain_buffer(), _loop).result(timeout=1)
-            except Exception:
-                log.exception("drain after wait-ready failed")
-            try:
-                _enqueue_update_dict(data)
-            except Exception:
-                log.exception("enqueue after wait-ready failed")
-            return "ok", 200
-
-        with _buf_lock:
-            _buf.append(data)
-        log.warning("Buffered update while PTB not ready (queue=%d)", len(_buf))
+    # Если приложение уже создано — отправляем прямо сейчас
+    if _app is not None:
+        try:
+            # Ленивый drain: если что-то осталось в буфере — досольём
+            if _buf:
+                try:
+                    asyncio.run_coroutine_threadsafe(_drain_buffer(), _loop).result(timeout=1)
+                except Exception:
+                    log.exception("lazy drain failed")
+            _enqueue_update_dict(data)
+        except Exception:
+            log.exception("Error enqueuing update")
         return "ok", 200
 
-    # PTB уже готов — на всякий случай лениво промываем буфер и отправляем текущий апдейт
-    try:
-        if _buf:  # ленивый drain, если что-то застряло
-            try:
-                asyncio.run_coroutine_threadsafe(_drain_buffer(), _loop).result(timeout=1)
-            except Exception:
-                log.exception("lazy drain failed")
-        _enqueue_update_dict(data)
-    except Exception:
-        log.exception("Error enqueuing update")
+    # Иначе ждём до 5 секунд; если за это время PTB поднялся — кидаем туда
+    if _ready.wait(timeout=5.0) and _app is not None:
+        try:
+            asyncio.run_coroutine_threadsafe(_drain_buffer(), _loop).result(timeout=1)
+        except Exception:
+            log.exception("drain after wait-ready failed")
+        try:
+            _enqueue_update_dict(data)
+        except Exception:
+            log.exception("enqueue after wait-ready failed")
+        return "ok", 200
 
+    # Совсем рано — буферим, чтобы не потерять апдейт
+    with _buf_lock:
+        _buf.append(data)
+    log.warning("Buffered update while PTB not ready (queue=%d)", len(_buf))
     return "ok", 200
 
-# ---------- local run (dev) ----------
+# -------------------- local run (dev only) --------------------
 if __name__ == "__main__":
     app_flask.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
