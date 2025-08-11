@@ -1,12 +1,10 @@
 # bot.py
-# --- Простая и надежная реализация вебхука на Flask + Telegram HTTP API ---
-# Работает на Render/Gunicorn без фоновых потоков и event loop.
-# Переменные окружения: BOT_TOKEN, WEBHOOK_SECRET, APP_URL
-#
-# Эндпоинты:
-#   GET  /health                             -> {"status":"ok"}
-#   GET  /                                   -> короткий текст и echo стата
-#   POST /webhook/<WEBHOOK_SECRET>           -> прием апдейтов от Telegram
+# --- Вебхук бот на Flask + httpx (без PTB/async) ---
+# Переменные окружения:
+#   BOT_TOKEN       — токен бота
+#   WEBHOOK_SECRET  — секретный сегмент (например, mySecret_2025)
+#   APP_URL         — публичный URL сервиса на Render, например:
+#                     https://my-telegram-bot-xxxx.onrender.com
 
 from __future__ import annotations
 
@@ -14,11 +12,11 @@ import json
 import os
 import sys
 import time
-import typing as t
 from dataclasses import dataclass
 
 import httpx
 from flask import Flask, abort, jsonify, request
+
 
 # -------------------- Конфиг --------------------
 
@@ -34,7 +32,6 @@ class Config:
 
     @property
     def webhook_url(self) -> str:
-        # Вебхук всегда ведет на /webhook/<secret>
         return f"{self.app_url.rstrip('/')}/webhook/{self.secret}"
 
 
@@ -55,43 +52,33 @@ def load_config() -> Config:
 
 CFG = load_config()
 
-# Единый HTTP-клиент (keep-alive), чтобы не тратить время на соединения
 HTTP_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 CLIENT = httpx.Client(timeout=HTTP_TIMEOUT)
 
 
 def tg_api(method: str, payload: dict) -> dict:
-    """Вызов Telegram Bot API с обработкой ошибок."""
     url = f"{CFG.api_base}/{method}"
-    try:
-        r = CLIENT.post(url, json=payload)
-        r.raise_for_status()
-        data = r.json()
-        if not data.get("ok", False):
-            raise RuntimeError(f"Telegram API error: {data}")
-        return data
-    except Exception as e:
-        print(f"[tg_api] {method} failed: {e}", file=sys.stderr)
-        raise
+    r = CLIENT.post(url, json=payload)
+    r.raise_for_status()
+    data = r.json()
+    if not data.get("ok", False):
+        raise RuntimeError(f"Telegram API error: {data}")
+    return data
 
 
 def set_webhook() -> None:
-    """Ставит (или переcтавит) вебхук с нужным URL."""
-    # Сначала удалим, затем поставим — так надежнее при повторных деплоях
+    """Удаляем старый вебхук и ставим новый."""
     try:
         tg_api("deleteWebhook", {"drop_pending_updates": False})
-    except Exception:
-        # Не критично, просто продолжим
-        pass
+    except Exception as e:
+        # Не критично если не было вебхука
+        print(f"[init] deleteWebhook warning: {e}", file=sys.stderr)
 
-    # Ставим вебхук
     tg_api(
         "setWebhook",
         {
             "url": CFG.webhook_url,
-            # Можно ограничить типы апдейтов, если нужно
             "allowed_updates": ["message", "edited_message"],
-            # На рендере внешний сертификат не нужен
         },
     )
     print(f"[init] Webhook set -> {CFG.webhook_url}", file=sys.stderr)
@@ -101,18 +88,19 @@ def set_webhook() -> None:
 
 app = Flask(__name__)
 
-# Простая внутренняя «статистика» — чтобы видеть, что живём
+# Ставим вебхук при импорте модуля (Flask 3 больше не поддерживает before_first_request)
+try:
+    set_webhook()
+except Exception as e:
+    # Не валим воркер — логируем и продолжаем; Telegram повторит setWebhook при следующем деплое
+    print(f"[init] set_webhook error: {e}", file=sys.stderr)
+
+# Простая статистика
 STATS = {
     "start_ts": int(time.time()),
     "updates": 0,
     "last_update_ts": 0,
 }
-
-
-@app.before_first_request
-def _on_startup() -> None:
-    # Ставим вебхук при старте воркера gunicorn
-    set_webhook()
 
 
 @app.get("/")
@@ -131,7 +119,7 @@ def health():
 
 
 def _handle_message(msg: dict) -> None:
-    """Базовая логика: /start -> приветствие, иначе — эхо."""
+    """Обработка сообщений: /start -> привет, иначе эхо."""
     chat = msg.get("chat") or {}
     chat_id = chat.get("id")
     if not chat_id:
@@ -141,7 +129,6 @@ def _handle_message(msg: dict) -> None:
     if text.startswith("/start"):
         reply = "Привет! Я на связи 🤖"
     else:
-        # Простое эхо
         reply = f"Ты написал: {text}" if text else "Я получил сообщение 🙂"
 
     tg_api(
@@ -156,7 +143,7 @@ def _handle_message(msg: dict) -> None:
 
 @app.post(f"/webhook/{CFG.secret}")
 def telegram_webhook():
-    """Основной обработчик вебхука Telegram."""
+    """Прием апдейтов от Telegram."""
     try:
         payload = request.get_json(force=True, silent=False)
     except Exception:
@@ -165,24 +152,24 @@ def telegram_webhook():
     if not isinstance(payload, dict):
         abort(400)
 
-    # Обновим статистику
     STATS["updates"] += 1
     STATS["last_update_ts"] = int(time.time())
 
-    # Обрабатываем только сообщения
     message = payload.get("message") or payload.get("edited_message")
     if message:
         try:
             _handle_message(message)
         except Exception as e:
-            # Не роняем веб-хук — логируем и отвечаем 200, чтобы TG не слал ретраи бесконечно
-            print(f"[webhook] handle error: {e}\npayload={json.dumps(payload, ensure_ascii=False)}", file=sys.stderr)
+            # Логируем, но отвечаем 200 — иначе Telegram будет ретраить
+            print(
+                f"[webhook] handle error: {e}\n"
+                f"payload={json.dumps(payload, ensure_ascii=False)}",
+                file=sys.stderr,
+            )
 
-    # Telegram ждёт быстрый 200 OK
     return jsonify(ok=True)
 
 
-# Дополнительно: если хочется видеть «буфер»/вебхук в json (удобно для ручной проверки)
 @app.get("/debug")
 def debug():
     return jsonify(
@@ -192,5 +179,5 @@ def debug():
     )
 
 
-# Точка входа для gunicorn: `gunicorn bot:app` или `gunicorn bot:app_flask`
-app_flask = app  # совместимость с твоей текущей Proc/Render командой
+# Точка входа для gunicorn
+app_flask = app
