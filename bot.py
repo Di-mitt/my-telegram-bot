@@ -1,201 +1,196 @@
 # bot.py
-import os
+# --- Простая и надежная реализация вебхука на Flask + Telegram HTTP API ---
+# Работает на Render/Gunicorn без фоновых потоков и event loop.
+# Переменные окружения: BOT_TOKEN, WEBHOOK_SECRET, APP_URL
+#
+# Эндпоинты:
+#   GET  /health                             -> {"status":"ok"}
+#   GET  /                                   -> короткий текст и echo стата
+#   POST /webhook/<WEBHOOK_SECRET>           -> прием апдейтов от Telegram
+
+from __future__ import annotations
+
 import json
+import os
+import sys
 import time
-import logging
-import threading
-import atexit
-import asyncio
-from collections import deque
-from typing import Deque, Tuple, Any
+import typing as t
+from dataclasses import dataclass
 
-from flask import Flask, request, jsonify
+import httpx
+from flask import Flask, abort, jsonify, request
 
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    filters,
-)
+# -------------------- Конфиг --------------------
 
-# ----------------------- ЛОГИ -----------------------
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-log = logging.getLogger("bot")
+@dataclass
+class Config:
+    token: str
+    secret: str
+    app_url: str
 
-# ----------------------- ENV ------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
-APP_URL = os.getenv("APP_URL", "").rstrip("/")
+    @property
+    def api_base(self) -> str:
+        return f"https://api.telegram.org/bot{self.token}"
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set")
-if not WEBHOOK_SECRET:
-    raise RuntimeError("WEBHOOK_SECRET is not set")
-if not APP_URL:
-    raise RuntimeError("APP_URL is not set")
-
-WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
-WEBHOOK_URL = f"{APP_URL}{WEBHOOK_PATH}"
-
-# ----------------------- Flask ----------------------
-app_flask = Flask(__name__)
-
-# -------------------- PTB runtime -------------------
-_application: Application | None = None
-_ptb_loop: asyncio.AbstractEventLoop | None = None
-_ptb_ready: bool = False
-
-# буфер апдейтов (если пришли раньше, чем запустился PTB)
-_buffer_max = 50
-_buffer: Deque[Tuple[dict, float]] = deque(maxlen=_buffer_max)
-_buffer_lock = threading.Lock()
-
-# событие для аккуратной остановки PTB
-_stop_event: asyncio.Event | None = None
+    @property
+    def webhook_url(self) -> str:
+        # Вебхук всегда ведет на /webhook/<secret>
+        return f"{self.app_url.rstrip('/')}/webhook/{self.secret}"
 
 
-# --------------- Хэндлеры бота ----------------------
-async def cmd_start(update: Update, _):
-    await update.effective_chat.send_message("Привет! Я на связи 🤖")
+def load_config() -> Config:
+    token = os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
+    secret = os.environ.get("WEBHOOK_SECRET") or "mySecret_2025"
+    app_url = os.environ.get("APP_URL")
 
-async def any_text(update: Update, _):
-    if update.message and update.message.text:
-        await update.message.reply_text(f"Ты написал: {update.message.text}")
+    if not token:
+        print("ERROR: BOT_TOKEN is not set", file=sys.stderr)
+        sys.exit(1)
+    if not app_url:
+        print("ERROR: APP_URL is not set", file=sys.stderr)
+        sys.exit(1)
 
-
-# --------------- Работа с буфером -------------------
-def _buffer_push(data: dict):
-    with _buffer_lock:
-        _buffer.append((data, time.monotonic()))
-        log.warning("Webhook: got update while PTB not ready -> buffer (total=%d)", len(_buffer))
-
-async def _buffer_drain():
-    """Слить накопленные апдейты в PTB после старта."""
-    global _application
-    if not _application:
-        return
-    drained = 0
-    while True:
-        with _buffer_lock:
-            if not _buffer:
-                break
-            data, _ts = _buffer.popleft()
-        try:
-            upd = Update.de_json(data, _application.bot)
-            await _application.process_update(upd)
-            drained += 1
-        except Exception as e:
-            log.exception("Buffer drain failed: %s", e)
-    if drained:
-        log.info("Buffer drained: %d updates", drained)
+    return Config(token=token.strip(), secret=secret.strip(), app_url=app_url.strip())
 
 
-# --------------- PTB поток / цикл -------------------
-async def _ptb_start():
-    """Инициализация и запуск PTB в отдельном event loop."""
-    global _application, _ptb_ready, _stop_event
+CFG = load_config()
 
-    log.info("PTB: building application...")
-    _application = Application.builder().token(BOT_TOKEN).build()
+# Единый HTTP-клиент (keep-alive), чтобы не тратить время на соединения
+HTTP_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
+CLIENT = httpx.Client(timeout=HTTP_TIMEOUT)
 
-    # Роуты/хэндлеры
-    _application.add_handler(CommandHandler("start", cmd_start))
-    _application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, any_text))
 
-    # Инициализация/старт без собственного веб-сервера PTB —
-    # мы сами принимаем HTTP во Flask и кидаем апдейты в process_update.
-    await _application.initialize()
-    await _application.start()
-
-    # Вебхук ставим руками (его будет дергать Telegram -> Flask)
+def tg_api(method: str, payload: dict) -> dict:
+    """Вызов Telegram Bot API с обработкой ошибок."""
+    url = f"{CFG.api_base}/{method}"
     try:
-        await _application.bot.delete_webhook(drop_pending_updates=False)
-        await _application.bot.set_webhook(url=WEBHOOK_URL, secret_token=WEBHOOK_SECRET)
-        log.info("PTB: webhook set -> %s", WEBHOOK_URL)
+        r = CLIENT.post(url, json=payload)
+        r.raise_for_status()
+        data = r.json()
+        if not data.get("ok", False):
+            raise RuntimeError(f"Telegram API error: {data}")
+        return data
     except Exception as e:
-        log.exception("Failed to set webhook: %s", e)
+        print(f"[tg_api] {method} failed: {e}", file=sys.stderr)
+        raise
 
-    _ptb_ready = True
-    await _buffer_drain()
 
-    _stop_event = asyncio.Event()
-    await _stop_event.wait()
-
-    # Остановка
+def set_webhook() -> None:
+    """Ставит (или переcтавит) вебхук с нужным URL."""
+    # Сначала удалим, затем поставим — так надежнее при повторных деплоях
     try:
-        await _application.stop()
-        await _application.shutdown()
+        tg_api("deleteWebhook", {"drop_pending_updates": False})
     except Exception:
-        log.exception("PTB stop/shutdown error")
+        # Не критично, просто продолжим
+        pass
+
+    # Ставим вебхук
+    tg_api(
+        "setWebhook",
+        {
+            "url": CFG.webhook_url,
+            # Можно ограничить типы апдейтов, если нужно
+            "allowed_updates": ["message", "edited_message"],
+            # На рендере внешний сертификат не нужен
+        },
+    )
+    print(f"[init] Webhook set -> {CFG.webhook_url}", file=sys.stderr)
 
 
-def _ptb_thread():
-    """Отдельный поток с собственным asyncio loop."""
-    global _ptb_loop
-    _ptb_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(_ptb_loop)
-    try:
-        _ptb_loop.run_until_complete(_ptb_start())
-    finally:
-        _ptb_loop.run_until_complete(asyncio.sleep(0))
-        _ptb_loop.close()
+# -------------------- Flask app --------------------
+
+app = Flask(__name__)
+
+# Простая внутренняя «статистика» — чтобы видеть, что живём
+STATS = {
+    "start_ts": int(time.time()),
+    "updates": 0,
+    "last_update_ts": 0,
+}
 
 
-# Стартуем PTB-поток сразу при импорте модуля (когда gunicorn грузит воркер)
-_ptb_thread_handle = threading.Thread(target=_ptb_thread, name="ptb-thread", daemon=True)
-_ptb_thread_handle.start()
+@app.before_first_request
+def _on_startup() -> None:
+    # Ставим вебхук при старте воркера gunicorn
+    set_webhook()
 
 
-def _ptb_shutdown():
-    """Вызывается при завершении процесса (gunicorn SIGTERM)."""
-    global _ptb_loop, _stop_event
-    if _ptb_loop and _stop_event:
-        try:
-            _ptb_loop.call_soon_threadsafe(_stop_event.set)
-        except Exception:
-            pass
-
-atexit.register(_ptb_shutdown)
-
-# -------------------- Flask routes -------------------
-@app_flask.get("/")
+@app.get("/")
 def index():
-    return "ok"
-
-@app_flask.get("/health")
-def health():
     return jsonify(
         status="ok",
-        ptb_ready=_ptb_ready,
-        buffer_size=len(_buffer),
-        buffer_max=_buffer_max,
-        webhook_url=WEBHOOK_URL,
+        webhook_url=CFG.webhook_url,
+        updates=STATS["updates"],
+        up_seconds=int(time.time()) - STATS["start_ts"],
     )
 
-@app_flask.post(WEBHOOK_PATH)
+
+@app.get("/health")
+def health():
+    return jsonify(status="ok")
+
+
+def _handle_message(msg: dict) -> None:
+    """Базовая логика: /start -> приветствие, иначе — эхо."""
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
+    if not chat_id:
+        return
+
+    text = msg.get("text") or ""
+    if text.startswith("/start"):
+        reply = "Привет! Я на связи 🤖"
+    else:
+        # Простое эхо
+        reply = f"Ты написал: {text}" if text else "Я получил сообщение 🙂"
+
+    tg_api(
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": reply,
+            "disable_web_page_preview": True,
+        },
+    )
+
+
+@app.post(f"/webhook/{CFG.secret}")
 def telegram_webhook():
-    # Проверка секрета (Telegram присылает этот заголовок)
-    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-    if secret != WEBHOOK_SECRET:
-        return "forbidden", 403
-
-    # Получаем апдейт
-    data = request.get_json(silent=True, force=True) or {}
-
-    # Если PTB ещё не готов — кладём в буфер
-    if not _ptb_ready or not _application or not _ptb_loop:
-        _buffer_push(data)
-        return "ok", 200
-
-    # Пробрасываем апдейт в PTB non-blocking
+    """Основной обработчик вебхука Telegram."""
     try:
-        upd = Update.de_json(data, _application.bot)
-        asyncio.run_coroutine_threadsafe(_application.process_update(upd), _ptb_loop)
-    except Exception as e:
-        log.exception("Webhook update processing failed: %s", e)
+        payload = request.get_json(force=True, silent=False)
+    except Exception:
+        abort(400)
 
-    return "ok", 200
+    if not isinstance(payload, dict):
+        abort(400)
+
+    # Обновим статистику
+    STATS["updates"] += 1
+    STATS["last_update_ts"] = int(time.time())
+
+    # Обрабатываем только сообщения
+    message = payload.get("message") or payload.get("edited_message")
+    if message:
+        try:
+            _handle_message(message)
+        except Exception as e:
+            # Не роняем веб-хук — логируем и отвечаем 200, чтобы TG не слал ретраи бесконечно
+            print(f"[webhook] handle error: {e}\npayload={json.dumps(payload, ensure_ascii=False)}", file=sys.stderr)
+
+    # Telegram ждёт быстрый 200 OK
+    return jsonify(ok=True)
+
+
+# Дополнительно: если хочется видеть «буфер»/вебхук в json (удобно для ручной проверки)
+@app.get("/debug")
+def debug():
+    return jsonify(
+        status="ok",
+        webhook_url=CFG.webhook_url,
+        stats=STATS,
+    )
+
+
+# Точка входа для gunicorn: `gunicorn bot:app` или `gunicorn bot:app_flask`
+app_flask = app  # совместимость с твоей текущей Proc/Render командой
